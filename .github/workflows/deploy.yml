@@ -1,4 +1,4 @@
-name: Auto Deploy All React Projects
+name: Auto Deploy All React Projects (safe)
 
 on:
   push:
@@ -8,9 +8,8 @@ permissions:
   contents: write
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -22,61 +21,111 @@ jobs:
         with:
           node-version: 20
 
-      - name: Build all React projects
+      - name: Build projects (skip if no build)
         run: |
-          REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          set -e
 
-          for folder in */; do
-            folder=${folder%/}
+          REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+          echo "Repo name: $REPO_NAME"
+
+          BUILT=0
+          FAILURES=()
+
+          for d in */; do
+            folder=${d%/}
+
+            # skip .github
+            if [ "$folder" = ".github" ]; then
+              continue
+            fi
 
             if [ -f "$folder/package.json" ]; then
-              echo "Building $folder..."
-
-              npm ci --prefix "$folder"
-
-              # Check if Vite
+              echo "---- Checking $folder ----"
+              # check for a build script
+              has_build_script=false
+              if grep -q '"build"\s*:' "$folder/package.json"; then
+                has_build_script=true
+              fi
+              # if vite is present, we can use vite build
+              is_vite=false
               if grep -q '"vite"' "$folder/package.json"; then
-                echo "Vite project detected"
-                npx --yes vite build --cwd "$folder" --base "/$REPO_NAME/$folder/"
+                is_vite=true
+              fi
+
+              if [ "$has_build_script" = "false" ] && [ "$is_vite" = "false" ]; then
+                echo "Skipping $folder — no build script and not a Vite project."
+                continue
+              fi
+
+              echo "Building $folder..."
+              # do not exit entire job if a project build fails — capture error
+              set +e
+              npm ci --prefix "$folder" >/tmp/npmci-$folder.log 2>&1
+              if [ "$is_vite" = "true" ]; then
+                npx --yes vite build --cwd "$folder" --base "/$REPO_NAME/$folder/" >/tmp/build-$folder.log 2>&1
+                build_status=$?
               else
-                echo "CRA project detected"
-                PUBLIC_URL="/$REPO_NAME/$folder" npm --prefix "$folder" run build
+                # run the build script (CRA or custom)
+                PUBLIC_URL="/$REPO_NAME/$folder" npm --prefix "$folder" run build >/tmp/build-$folder.log 2>&1
+                build_status=$?
+              fi
+              set -e
+
+              if [ $build_status -ne 0 ]; then
+                echo "!!! Build FAILED for $folder (logs below) !!!"
+                echo "---- npm ci output ----"
+                sed -n '1,200p' /tmp/npmci-$folder.log || true
+                echo "---- build output (tail) ----"
+                tail -n 200 /tmp/build-$folder.log || true
+                FAILURES+=("$folder")
+              else
+                echo "Build succeeded for $folder"
+                BUILT=$((BUILT+1))
               fi
             fi
           done
 
-      - name: Deploy to gh-pages
-        run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
+          echo "Built count: $BUILT"
+          if [ ${#FAILURES[@]} -ne 0 ]; then
+            echo "Some projects failed to build: ${FAILURES[*]}"
+          fi
 
-          rm -rf gh-pages
+      - name: Prepare gh-pages & copy outputs
+        run: |
+          set -e
+          rm -rf gh-pages || true
           mkdir gh-pages
 
-          for folder in */; do
-            folder=${folder%/}
-
+          for d in */; do
+            folder=${d%/}
+            if [ "$folder" = ".github" ]; then
+              continue
+            fi
             if [ -d "$folder/build" ]; then
-              mkdir -p gh-pages/$folder
-              cp -r "$folder/build/"* gh-pages/$folder/
-            fi
-
-            if [ -d "$folder/dist" ]; then
-              mkdir -p gh-pages/$folder
-              cp -r "$folder/dist/"* gh-pages/$folder/
+              mkdir -p gh-pages/"$folder"
+              cp -r "$folder"/build/* gh-pages/"$folder"/
+              echo "Copied $folder/build -> gh-pages/$folder"
+            elif [ -d "$folder/dist" ]; then
+              mkdir -p gh-pages/"$folder"
+              cp -r "$folder"/dist/* gh-pages/"$folder"/
+              echo "Copied $folder/dist -> gh-pages/$folder"
             fi
           done
 
-          echo "<h1>Projects</h1>" > gh-pages/index.html
-          for folder in gh-pages/*; do
-            fname=$(basename "$folder")
-            echo "<a href='./$fname/'>$fname</a><br>" >> gh-pages/index.html
+          # simple index
+          echo "<!doctype html><html><head><meta charset='utf-8'><title>Projects</title></head><body><h1>Projects</h1>" > gh-pages/index.html
+          for p in $(ls -d gh-pages/* 2>/dev/null || true); do
+            name=$(basename "$p")
+            echo "<a href='./$name/'>$name</a><br/>" >> gh-pages/index.html
           done
+          echo "</body></html>" >> gh-pages/index.html
 
           cd gh-pages
           git init
-          git add .
-          git commit -m "Auto Deploy"
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add -A
+          git commit -m "gh-pages: update builds from main @ $GITHUB_SHA" || echo "no changes to commit"
           git branch -M gh-pages
           git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git
           git push -f origin gh-pages
