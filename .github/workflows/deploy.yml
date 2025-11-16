@@ -1,0 +1,82 @@
+name: Auto Deploy All React Projects
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build all React projects
+        run: |
+          REPO_NAME=$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)
+
+          for folder in */; do
+            folder=${folder%/}
+
+            if [ -f "$folder/package.json" ]; then
+              echo "Building $folder..."
+
+              npm ci --prefix "$folder"
+
+              # Check if Vite
+              if grep -q '"vite"' "$folder/package.json"; then
+                echo "Vite project detected"
+                npx --yes vite build --cwd "$folder" --base "/$REPO_NAME/$folder/"
+              else
+                echo "CRA project detected"
+                PUBLIC_URL="/$REPO_NAME/$folder" npm --prefix "$folder" run build
+              fi
+            fi
+          done
+
+      - name: Deploy to gh-pages
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+          rm -rf gh-pages
+          mkdir gh-pages
+
+          for folder in */; do
+            folder=${folder%/}
+
+            if [ -d "$folder/build" ]; then
+              mkdir -p gh-pages/$folder
+              cp -r "$folder/build/"* gh-pages/$folder/
+            fi
+
+            if [ -d "$folder/dist" ]; then
+              mkdir -p gh-pages/$folder
+              cp -r "$folder/dist/"* gh-pages/$folder/
+            fi
+          done
+
+          echo "<h1>Projects</h1>" > gh-pages/index.html
+          for folder in gh-pages/*; do
+            fname=$(basename "$folder")
+            echo "<a href='./$fname/'>$fname</a><br>" >> gh-pages/index.html
+          done
+
+          cd gh-pages
+          git init
+          git add .
+          git commit -m "Auto Deploy"
+          git branch -M gh-pages
+          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git
+          git push -f origin gh-pages
